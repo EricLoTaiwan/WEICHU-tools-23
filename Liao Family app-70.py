@@ -1000,7 +1000,7 @@ def get_realtime_flight_status(flight_number, std_time_str):
     return sched_str, gate_str, delay_mins, sched_takeoff_str, takeoff_str, taxi_mins, eta_str
 
 # ==========================================
-# 全局航班常態資料庫
+# 全局航班常態資料庫 (原始設定基礎)
 # ==========================================
 MASTER_STATIC_DB = {
     "BR9": {"FROM": "Vancouver (YVR)", "To": "Taipei (TPE)", "AIRCRAFT": "77W", "STD": "02:00", "STA": "05:25", "Total Time": "13h 25m", "Days": [1,2,3,4,5,6,7]},
@@ -1081,11 +1081,76 @@ MASTER_STATIC_DB = {
     "BR198": {"FROM": "Taipei (TPE)", "To": "Tokyo (NRT)", "AIRCRAFT": "787", "STD": "08:50", "STA": "13:15", "Total Time": "3h 25m", "Days": [1,2,3,4,5,6,7]},
 }
 
+# ==========================================
+# 每日自動抓取並更新常態資料庫 (一天僅執行一次)
+# ==========================================
+@st.cache_data(ttl=86400, show_spinner="🔄 每日例行更新常態航班資料庫 (一天僅執行一次，約需 30-60 秒)...")
+def get_daily_updated_db():
+    updated_db = {}
+    for k, v in MASTER_STATIC_DB.items():
+        updated_db[k] = v.copy()
+
+    def fetch_flight_times(flight_no, info):
+        fa_flight_id = flight_no.upper().replace("BR", "EVA")
+        fa_url = f"https://zh-tw.flightaware.com/live/flight/{fa_flight_id}"
+        payload = {
+            'api_key': "c84488b98c1d6af5b8b94b306c2e6001",
+            'url': fa_url
+        }
+        try:
+            res = requests.get('http://api.scraperapi.com', params=payload, timeout=15)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.text, "html.parser")
+                scripts = soup.find_all("script")
+                for s in scripts:
+                    if s.string and "__APOLLO_STATE__" in s.string:
+                        match = re.search(r'__APOLLO_STATE__\s*=\s*({.*?});', s.string, re.DOTALL)
+                        if match:
+                            apollo_data = json.loads(match.group(1))
+                            today_str = datetime.now(TW_TZ).strftime("%Y-%m-%d")
+                            
+                            for key, val in apollo_data.items():
+                                if isinstance(val, dict) and "gateDepartureTimes" in val and "gateArrivalTimes" in val:
+                                    s_ts = val.get("gateDepartureTimes", {}).get("scheduled") or val.get("takeoffTimes", {}).get("scheduled")
+                                    a_ts = val.get("gateArrivalTimes", {}).get("scheduled") or val.get("landingTimes", {}).get("scheduled")
+                                    
+                                    if s_ts:
+                                        # 確保只抓取與今日相關的航班計畫表，防止亂抓到過去的
+                                        dt_str = datetime.fromtimestamp(s_ts, TW_TZ).strftime("%Y-%m-%d")
+                                        if dt_str == today_str:
+                                            info["STD"] = datetime.fromtimestamp(s_ts, TW_TZ).strftime("%H:%M")
+                                            if a_ts: 
+                                                info["STA"] = datetime.fromtimestamp(a_ts, TW_TZ).strftime("%H:%M")
+                                                # 同步更新正確的總飛行時間
+                                                if a_ts > s_ts:
+                                                    total_mins = int((a_ts - s_ts) / 60)
+                                                    h = total_mins // 60
+                                                    m = total_mins % 60
+                                                    info["Total Time"] = f"{h}h {m}m"
+                                            return flight_no, info
+        except Exception:
+            pass
+        return flight_no, info
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_flight = {executor.submit(fetch_flight_times, f, info): f for f, info in updated_db.items()}
+        for future in concurrent.futures.as_completed(future_to_flight):
+            try:
+                f_no, updated_info = future.result()
+                updated_db[f_no] = updated_info
+            except:
+                pass
+
+    return updated_db
+
+# 自動啟用每日更新的常態資料庫
+DYNAMIC_MASTER_DB = get_daily_updated_db()
+
 def fetch_single_flight(flight_number):
     flight_upper = flight_number.upper()
     
-    if flight_upper in MASTER_STATIC_DB:
-        record = MASTER_STATIC_DB[flight_upper]
+    if flight_upper in DYNAMIC_MASTER_DB:
+        record = DYNAMIC_MASTER_DB[flight_upper]
         return {
             "Flight": flight_upper,
             "FROM": record["FROM"],
@@ -1537,19 +1602,12 @@ with tab1:
                 sched_dep_str_html = f"<span style='color:#333333;'>{sched_dep_str}</span>"
                 if any(x in str(sched_dep_str) for x in ["無資料", "無法計算"]): sched_dep_str_html = f"<span style='color:#757575;'>{sched_dep_str}</span>"
 
-                if delay_mins in ["無資料", "尚未出發", "無法計算", "尚未起飛"]:
-                    delay_html = f"<span style='color:#757575;'>{delay_mins}</span>"
-                elif isinstance(delay_mins, int) and delay_mins > 0:
-                    delay_html = f"<span style='color:#d32f2f;'>{delay_mins} 分鐘</span>"
-                else:
-                    delay_html = "<span style='color:#2e7d32;'>0 分鐘 (準點)</span>"
-                    
                 flight_time_str_out = format_total_time(outbound_flight["Flight"], outbound_flight.get("Total Time", ""))
 
                 st.markdown(f'''
                     <div class="time-premium-box">
-                        <div class="time-row"><span class="time-label">⏱️ 計畫出發時間:</span> <span class="time-value">{sched_dep_str_html}</span></div>
-                        <div class="time-row"><span class="time-label">⏳ Delay 時間:</span> <span class="time-value">{delay_html}</span></div>
+                        <div class="time-row"><span class="time-label">⏱️ 計畫出發時間 (STD):</span> <span class="time-value">{sched_dep_str_html}</span></div>
+                        <div class="time-row"><span class="time-label">🛬 計畫抵達時間 (STA):</span> <span class="time-value"><span style='color:#333333;'>{outbound_flight["STA"]}</span></span></div>
                         <div class="time-row" style="border-bottom:none;"><span class="time-label">⏱️ 總飛行時間:</span> <span class="time-value"><span style='color:#1565C0;'>{flight_time_str_out}</span></span></div>
                         <div style="margin-top: 12px; text-align: right;">
                             <a href="{fa_url_out}" target="_blank" class="live-link-btn" style="background-color: #E65100; font-size: 22px; padding: 12px 20px; border-radius: 8px;">✈️ 航班雷達動態</a>
@@ -1581,19 +1639,12 @@ with tab1:
                 sched_dep_str_html_ret = f"<span style='color:#333333;'>{sched_dep_str_ret}</span>"
                 if any(x in str(sched_dep_str_ret) for x in ["無資料", "無法計算"]): sched_dep_str_html_ret = f"<span style='color:#757575;'>{sched_dep_str_ret}</span>"
 
-                if delay_mins_ret in ["無資料", "尚未出發", "無法計算", "尚未起飛"]:
-                    delay_html_ret = f"<span style='color:#757575;'>{delay_mins_ret}</span>"
-                elif isinstance(delay_mins_ret, int) and delay_mins_ret > 0:
-                    delay_html_ret = f"<span style='color:#d32f2f;'>{delay_mins_ret} 分鐘</span>"
-                else:
-                    delay_html_ret = "<span style='color:#2e7d32;'>0 分鐘 (準點)</span>"
-                    
                 flight_time_str_ret = format_total_time(return_flight["Flight"], return_flight.get("Total Time", ""))
 
                 st.markdown(f'''
                     <div class="time-premium-box">
-                        <div class="time-row"><span class="time-label">⏱️ 計畫出發時間:</span> <span class="time-value">{sched_dep_str_html_ret}</span></div>
-                        <div class="time-row"><span class="time-label">⏳ Delay 時間:</span> <span class="time-value">{delay_html_ret}</span></div>
+                        <div class="time-row"><span class="time-label">⏱️ 計畫出發時間 (STD):</span> <span class="time-value">{sched_dep_str_html_ret}</span></div>
+                        <div class="time-row"><span class="time-label">🛬 計畫抵達時間 (STA):</span> <span class="time-value"><span style='color:#333333;'>{return_flight["STA"]}</span></span></div>
                         <div class="time-row" style="border-bottom:none;"><span class="time-label">⏱️ 總飛行時間:</span> <span class="time-value"><span style='color:#1565C0;'>{flight_time_str_ret}</span></span></div>
                         <div style="margin-top: 12px; text-align: right;">
                             <a href="{fa_url_ret}" target="_blank" class="live-link-btn" style="background-color: #E65100; font-size: 22px; padding: 12px 20px; border-radius: 8px;">✈️ 航班雷達動態</a>
@@ -1670,7 +1721,7 @@ with tab1:
             
             daily_flights = []
             
-            for flight_no, f_info in MASTER_STATIC_DB.items():
+            for flight_no, f_info in DYNAMIC_MASTER_DB.items():
                 if "TPE" in f_info["FROM"] or "Taipei" in f_info["FROM"]:
                     if current_weekday in f_info.get("Days", [1,2,3,4,5,6,7]):
                         std_str = f_info["STD"]
